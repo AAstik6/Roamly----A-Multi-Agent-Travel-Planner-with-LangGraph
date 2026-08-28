@@ -49,10 +49,10 @@ search_tools = None
 aviation_tools = {}
 
 async def initialize_mcp():
-  global search_tool
+  global search_tools
   global aviation_tools
 
-  if search_tool is not None and aviation_tools:
+  if search_tools is not None and aviation_tools:
     return
 
   tools = await client.get_tools()
@@ -62,10 +62,9 @@ async def initialize_mcp():
   for tool in tools:
     print(tool.name)
 
-  search_tool.next(
-    tool
-    for tool in tools
-    if tool.name == "tavily search"
+  search_tools = next(
+    (tool for tool in tools if tool.name == "tavily_search"),
+    None
   )
 
   aviation_tools = {
@@ -77,22 +76,26 @@ async def initialize_mcp():
 
 async def tavily_mcp_search(query:str):
   await initialize_mcp()
-  result = await search_tool.ainvoke(
+  result = await search_tools.ainvoke(
     {
       "query": query
     }
   )
   return result
 
-async def aviation_mcp_call(tool_name: str, tool_args: dict = None):
-  tools = await client.get_tools()
 
-  tool = next(
-    t for t in tools
-    if t.name == tool_name
-  )
+async def fetch_flight_reference_data():
+    tools = await client.get_tools()
+    tool_map = {t.name: t for t in tools}
 
-  result = await tool.ainvoke(
-    tool_args or {}
-  )
-  return result
+    for name in ("list_airports", "list_airlines"):
+        if name not in tool_map:
+            raise RuntimeError(
+                f"Tool {name!r} not found. Available: {list(tool_map)}"
+            )
+
+    airports_result, airlines_result = await asyncio.gather(
+        tool_map["list_airports"].ainvoke({}),
+        tool_map["list_airlines"].ainvoke({}),
+    )
+    return airports_result, airlines_result
