@@ -1,7 +1,7 @@
-from mcp_client_test import tavily_mcp_search
+# test.py
 import asyncio
-from mcp_client import get_all_tools
-
+from mcp_client import weather_mcp_forecast
 
 if __name__ == "__main__":
-  asyncio.run(get_all_tools())
+    result = asyncio.run(weather_mcp_forecast("London", days=5))
+    print(result)
