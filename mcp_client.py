@@ -7,6 +7,7 @@ import httpx
 import re
 import json
 
+
 load_dotenv()
 TAVILY_API_KEY = os.getenv("TAVILY_API_KEY")
 AVIATIONSTACK_API_KEY = os.getenv("AVIATIONSTACK_API_KEY")
@@ -41,6 +42,7 @@ client = MultiServerMCPClient(
   }
 )
 
+
 # Check if the client is connected to all the tools
 async def get_all_tools():
   tools = await client.get_tools()
@@ -54,9 +56,10 @@ async def get_all_tools():
 
 
 
-################################
-# Tavily and Aviation Tools
-################################
+########################################
+# Tavily, Aviation and Weather Tools
+########################################
+
 
 search_tools = None
 aviation_tools = {}
@@ -173,6 +176,27 @@ async def weather_mcp_forecast(city: str, days: int = 5):
     return _parse_forecast_markdown(location, raw_text)
 
 
+
+# =========================
+# Multi-city forecast (for country-level itineraries)
+# =========================
+
+async def weather_mcp_multi_forecast(cities: list[str], days: int = 5) -> dict[str, str]:
+    """
+    Fetch forecasts for multiple cities concurrently.
+    Returns {city_name: forecast_string_or_error}.
+    """
+    async def safe_forecast(city: str):
+        try:
+            return city, await weather_mcp_forecast(city, days=days)
+        except Exception as e:
+            return city, f"Weather unavailable for {city}: {e}"
+
+    results = await asyncio.gather(*(safe_forecast(c) for c in cities))
+    return dict(results)
+
+
+
 WEATHER_CODES = {
     0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
     45: "fog", 48: "depositing rime fog",
@@ -182,6 +206,7 @@ WEATHER_CODES = {
     80: "slight rain showers", 81: "moderate rain showers", 82: "violent rain showers",
     95: "thunderstorm", 96: "thunderstorm with slight hail", 99: "thunderstorm with heavy hail",
 }
+
 
 
 def _parse_forecast_markdown(location: dict, raw_text: str) -> str:

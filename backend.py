@@ -25,7 +25,7 @@ from langchain_core.messages import (
 )
 from langchain_groq import ChatGroq
 # from tools.flight_tool import search_flights
-from mcp_client import fetch_flight_reference_data, tavily_mcp_search
+from mcp_client import fetch_flight_reference_data, tavily_mcp_search, weather_mcp_multi_forecast, weather_mcp_forecast
 import asyncio
 
 def get_database_url():
@@ -64,6 +64,7 @@ class TravelState(TypedDict):
     user_query: str
     flight_results: str
     hotel_results: str
+    weather_results: str
     itinerary: str
     llm_calls: int
 
@@ -171,12 +172,83 @@ def hotel_agent(state: TravelState):
 
 
 # ==========================
+# Weather Agent
+# ==========================
+
+
+import json
+
+WEATHER_CITY_EXTRACTION_PROMPT = """
+Analyze this travel query and determine the destination(s).
+
+Query: {query}
+
+Rules:
+- If the query names a specific city, return just that one city.
+- If the query names a country or region (not a specific city), return 3-5 major cities
+  a typical first-time tourist itinerary for that country would include.
+- Use well-known city names only (no ambiguous or made-up names).
+
+Respond with ONLY valid JSON, no other text, in this exact shape:
+{{"destination_type": "city" or "country", "location_name": "<country or city name>", "cities": ["City1", "City2", ...]}}
+"""
+
+def weather_agent(state: TravelState):
+    print("\nINSIDE WEATHER AGENT\n")
+
+    query = state["user_query"]
+    weather_data = None
+
+    try:
+        extraction_response = llm.invoke([
+            SystemMessage(content="You are a precise travel query parser. Respond only with valid JSON."),
+            HumanMessage(content=WEATHER_CITY_EXTRACTION_PROMPT.format(query=query))
+        ])
+
+        raw = extraction_response.content.strip()
+        # Strip markdown code fences if the model adds them
+        if raw.startswith("```"):
+            raw = raw.strip("`").replace("json", "", 1).strip()
+
+        parsed = json.loads(raw)
+        cities = parsed.get("cities", [])
+
+        print("\nEXTRACTED CITIES:", cities)
+
+        if not cities:
+            raise ValueError("No cities extracted from query")
+
+        city_forecasts = asyncio.run(weather_mcp_multi_forecast(cities, days=5))
+
+        print("\nWEATHER RESULTS:", city_forecasts)
+
+        # Combine into one readable block for downstream prompts
+        weather_data = "\n\n".join(
+            f"--- {city} ---\n{forecast}" for city, forecast in city_forecasts.items()
+        )
+
+    except Exception as e:
+        print(f"Weather information unavailable: {e}")
+        weather_data = "Weather data unavailable."
+
+    return {
+        "weather_results": weather_data,
+        "messages": [
+            AIMessage(content="Weather forecast fetched for all destination cities.")
+        ],
+        "llm_calls": state.get("llm_calls", 0) + 1
+    }
+
+
+# ==========================
 # Itinerary Agent
 # ==========================
 
+
 def itinerary_agent(state: TravelState):
     prompt = f"""
-Create a complete travel itinerary.
+Create a complete multi-city travel itinerary if the destination is a country,
+or a single-city itinerary if a specific city was requested.
 
 User Query:
 {state['user_query']}
@@ -187,10 +259,19 @@ Flight Results:
 Hotel Results:
 {state['hotel_results']}
 
-Make the itinerary practical, budget-aware, and easy to follow.
+Weather Forecast (per city):
+{state['weather_results']}
+
+Instructions:
+- If multiple cities are covered in the weather forecast, split the itinerary across those cities
+  in a sensible order (e.g. group nearby cities together, minimize backtracking).
+- For each day, reference that city's actual forecasted weather and suggest weather-appropriate
+  activities (e.g. indoor alternatives on rainy/stormy days, outdoor activities on clear days).
+- Make the itinerary practical, budget-aware, and easy to follow.
+- Include approximate travel time or transport between cities when the itinerary moves to a new city.
 """
     response = llm.invoke([
-        SystemMessage(content = "You are an expert travel planner."),
+        SystemMessage(content = "You are an expert multi-city travel planner."),
         HumanMessage(content=prompt)
     ])
 
@@ -201,9 +282,11 @@ Make the itinerary practical, budget-aware, and easy to follow.
     }
 
 
+
 # ============================
 # Final Response Agent
 # ============================
+
 
 def final_agent(state: TravelState):
     final_prompt = f"""
@@ -218,6 +301,9 @@ Flights:
 Hotels:
 {state['hotel_results']}
 
+Weather Forecast:
+{state.get('weather_results', 'Not available')}
+
 Itinerary:
 {state['itinerary']}
 
@@ -226,25 +312,19 @@ Format the final answer beautifully using these sections:
 1. Trip Summary
 2. Flight Information
 3. Hotel Suggestions
-4. Day-by-Day Itinerary
-5. Estimated Budget
-6. Final Recommendations
+4. Weather Forecast
+5. Day-by-Day Itinerary
+6. Estimated Budget
+7. Final Recommendations
 
 Important:
 - Be clear and practical.
 - Mention that live flight API may not provide ticket prices if pricing is unavailable.
+- Reference the weather forecast when relevant to packing or activity suggestions.
 - Keep the response useful for real travel planning.
 """
-    response = llm.invoke([
-        SystemMessage(content = "You are a professional AI travel booking assistant."),
-        HumanMessage(content = final_prompt)
-    ])
 
-    return {
-        "messages": [response],
-        "llm_calls": state.get("llm_calls", 0)+1
-    }
-
+    
 # =======================
 # Build Graph
 # =======================
@@ -253,12 +333,14 @@ graph = StateGraph(TravelState)
 
 graph.add_node("flight_agent", flight_agent)
 graph.add_node("hotel_agent", hotel_agent)
+graph.add_node("weather_agent", weather_agent)
 graph.add_node("itinerary_agent", itinerary_agent)
 graph.add_node("final_agent", final_agent)
 
 graph.add_edge(START, "flight_agent")
 graph.add_edge("flight_agent", "hotel_agent")
-graph.add_edge("hotel_agent", "itinerary_agent")
+graph.add_edge("hotel_agent", "weather_agent")
+graph.add_edge("weather_agent", "itinerary_agent")
 graph.add_edge("itinerary_agent", "final_agent")
 graph.add_edge("final_agent", END)
 
@@ -285,6 +367,7 @@ travel_graph = graph.compile(checkpointer = checkpointer) # adds the graph as th
 # function for FastAPI
 # =======================
 
+
 def run_travel_agent(user_input:str, thread_id:str | None = None):
     if not thread_id:
         thread_id = f"user_{uuid.uuid4().hex}"
@@ -303,6 +386,7 @@ def run_travel_agent(user_input:str, thread_id:str | None = None):
             "user_query": user_input,
             "flight_results": "",
             "hotel_results": "",
+            "weather_results": "",
             "itinerary": "",
             "llm_calls": 0
         },
@@ -316,6 +400,7 @@ def run_travel_agent(user_input:str, thread_id:str | None = None):
         "answer": final_answer,
         "flight_results": result.get("flight_results", ""),
         "hotel_results": result.get("hotel_results", ""),
+        "weather_results": result.get("weather_results", ""),
         "itinerary": result.get("itinerary", ""),
         "llm_calls": result.get("llm_calls", 0),
     }
